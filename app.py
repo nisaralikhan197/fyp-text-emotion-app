@@ -8,20 +8,22 @@ import os
 
 st.set_page_config(page_title="FYP: Text Emotion Detection", layout="centered")
 
-# --- CONFIG: update if your repo id changes ---
+# --- CONFIG ---
 HF_REPO_ID = "nisaralikhan1/text-emotion-detection"
 TF_MODEL_FILENAME = "tf_model.h5"   # name in HF repo
 CACHE_DIR = ".cache_model"
 
-# labels used in your training (same order used when training the model)
+# labels (must match training order)
 LABELS = ["sadness", "joy", "love", "anger", "fear", "surprise"]
 
 @st.cache_resource(show_spinner=False)
 def load_tokenizer_and_model(hf_repo_id=HF_REPO_ID, tf_filename=TF_MODEL_FILENAME):
     os.makedirs(CACHE_DIR, exist_ok=True)
+    # download model weights file into cache (if public, no token needed)
     model_local_path = hf_hub_download(repo_id=hf_repo_id, filename=tf_filename, cache_dir=CACHE_DIR)
     st.write(f"Model file cached at: `{model_local_path}`")
 
+    # load tokenizer from HF (requires tokenizer files uploaded to that repo)
     try:
         tokenizer = RobertaTokenizerFast.from_pretrained(hf_repo_id, cache_dir=CACHE_DIR)
         st.write("Tokenizer loaded from Hugging Face repo.")
@@ -30,19 +32,22 @@ def load_tokenizer_and_model(hf_repo_id=HF_REPO_ID, tf_filename=TF_MODEL_FILENAM
         tokenizer = None
 
     model = None
+    # try fast HF loading (may work if HF has proper TF checkpoint)
     try:
         model = TFRobertaForSequenceClassification.from_pretrained(hf_repo_id, from_tf=True, cache_dir=CACHE_DIR)
         st.write("Loaded TF model via transformers.from_pretrained().")
     except Exception:
+        # fallback: build architecture from config and load weights
         try:
             cfg = AutoConfig.from_pretrained(hf_repo_id, cache_dir=CACHE_DIR)
             model = TFRobertaForSequenceClassification.from_config(cfg)
             st.write("Created model architecture from config (no weights).")
+            # build variables by calling model once (use tokenizer if available)
             if tokenizer is not None:
                 dummy = tokenizer("Hello world", return_tensors="tf", truncation=True, padding="max_length", max_length=128)
                 _ = model(**{k: tf.constant(v) for k, v in dummy.items()})
             else:
-                seq_len = 128
+                seq_len = min(128, getattr(cfg, "max_position_embeddings", 128))
                 dummy_ids = tf.constant([[0] * seq_len], dtype=tf.int32)
                 dummy_att = tf.constant([[1] * seq_len], dtype=tf.int32)
                 _ = model(input_ids=dummy_ids, attention_mask=dummy_att)
