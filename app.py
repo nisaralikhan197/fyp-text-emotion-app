@@ -1,76 +1,86 @@
-# app.py (PyTorch loading; works without TensorFlow)
+# app.py (Streamlit + Hugging Face Inference API)
 import streamlit as st
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoConfig
-from huggingface_hub import hf_hub_download
-import torch
+import requests
 import numpy as np
-import os
 
-st.set_page_config(page_title="FYP: Text Emotion Detection", layout="centered")
+st.set_page_config(page_title="FYP: Text Emotion Detection (HF Inference)", layout="centered")
 
-# --- CONFIG ---
-HF_REPO_ID = "nisaralikhan1/text-emotion-detection"
-TF_MODEL_FILENAME = "tf_model.h5"   # file you uploaded to HF (weights in TF format)
-CACHE_DIR = ".cache_model"
+# --- CONFIG (change only if you uploaded model under a different HF username/repo) ---
+HF_MODEL = "nisaralikhan1/text-emotion-detection"   # Hugging Face model repo id
+HF_API_URL = f"https://api-inference.huggingface.co/models/{HF_MODEL}"
 
-LABELS = ["sadness", "joy", "love", "anger", "fear", "surprise"]
+# Map model label indices (LABEL_0 ..) to your emotion names (must match training order)
+LABEL_MAP = {
+    "LABEL_0": "sadness",
+    "LABEL_1": "joy",
+    "LABEL_2": "love",
+    "LABEL_3": "anger",
+    "LABEL_4": "fear",
+    "LABEL_5": "surprise"
+}
 
-@st.cache_resource(show_spinner=False)
-def load_tokenizer_and_model(repo_id=HF_REPO_ID, tf_filename=TF_MODEL_FILENAME):
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    model_local_path = hf_hub_download(repo_id=repo_id, filename=tf_filename, cache_dir=CACHE_DIR)
-    st.write(f"Model weights cached at `{model_local_path}`")
+st.title("FYP — Text Emotion Detection (Hugging Face Inference)")
+st.caption("Model runs on Hugging Face servers; this app calls the HF Inference API.")
 
-    # load tokenizer from HF repo
+text = st.text_area("Enter text to analyze", value="I am very happy today!", height=140)
+
+st.markdown("**Note:** If the model repo is private, add a Hugging Face token under app Settings → Secrets as `HF_TOKEN`.")
+
+def query_hf_inference(payload: dict, token: str | None = None):
+    headers = {"Accept": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    resp = requests.post(HF_API_URL, headers=headers, json=payload, timeout=60)
     try:
-        tokenizer = AutoTokenizer.from_pretrained(repo_id, cache_dir=CACHE_DIR)
-        st.write("Tokenizer loaded from Hugging Face repo.")
+        resp.raise_for_status()
     except Exception as e:
-        st.error("Could not load tokenizer from HF repo. Please ensure tokenizer files are uploaded.")
+        # show HF error message if present
+        st.error(f"Hugging Face API error: {resp.status_code} — {resp.text}")
         raise
-
-    # Try to load the model as a PyTorch model but using TF weights if needed
-    model = None
-    try:
-        # from_pretrained will auto-detect and convert TF weights if from_tf=True
-        # we set from_tf=True to tell HF to treat the stored weights as TF h5
-        # device_map=None and map_location ensures CPU use
-        model = AutoModelForSequenceClassification.from_pretrained(repo_id, from_tf=True, cache_dir=CACHE_DIR, torch_dtype=torch.float32, low_cpu_mem_usage=False)
-        st.write("Loaded model via transformers (PyTorch) using TF weights conversion.")
-    except Exception as e:
-        st.error("Failed to load model via transformers with from_tf=True: " + str(e))
-        raise
-
-    # set to eval and CPU
-    model.eval()
-    device = torch.device("cpu")
-    model.to(device)
-
-    return tokenizer, model, device
-
-tokenizer, model, device = load_tokenizer_and_model()
-
-st.title("FYP — Text Emotion Detection (PyTorch)")
-st.caption("Model loaded from Hugging Face and converted to PyTorch in the app (no TensorFlow required).")
-
-text = st.text_area("Enter text", value="I am very happy today!", height=140)
+    return resp.json()
 
 if st.button("Predict"):
     if not text.strip():
         st.warning("Please enter some text.")
     else:
-        with st.spinner("Tokenizing and running model..."):
-            inputs = tokenizer(text, return_tensors="pt", truncation=True, padding="max_length", max_length=128)
-            # move tensors to device
-            inputs = {k: v.to(device) for k, v in inputs.items()}
-            with torch.no_grad():
-                outputs = model(**inputs)
-                logits = outputs.logits.cpu().numpy()[0]
-                probs = np.exp(logits) / np.sum(np.exp(logits))
-                pred_idx = int(np.argmax(probs))
-                pred_label = LABELS[pred_idx] if pred_idx < len(LABELS) else str(pred_idx)
+        token = None
+        # If user added HF_TOKEN in Streamlit secrets, use it
+        if "HF_TOKEN" in st.secrets:
+            token = st.secrets["HF_TOKEN"]
 
-        st.write("**Predicted emotion:**", pred_label)
-        st.write("**Probabilities:**")
-        for i, lab in enumerate(LABELS):
-            st.write(f"{lab}: {probs[i]:.4f}")
+        with st.spinner("Sending text to Hugging Face Inference API..."):
+            # For sequence classification, HF accepts {"inputs": "text"} and returns list of {label,score}
+            try:
+                hf_payload = {"inputs": text, "options": {"wait_for_model": True}}
+                out = query_hf_inference(hf_payload, token=token)
+            except Exception:
+                st.stop()
+
+        # HF may return errors or a dict with "error"
+        if isinstance(out, dict) and out.get("error"):
+            st.error("HF Inference API returned an error: " + out.get("error"))
+        else:
+            # Expected: [{'label': 'LABEL_1', 'score': 0.8}, ...] OR sometimes {'label':..., 'score':...}
+            if isinstance(out, dict):
+                # single-label case
+                out = [out]
+
+            # Convert to stable format and map labels
+            try:
+                probs = {}
+                for item in out:
+                    label = item.get("label")
+                    score = float(item.get("score", 0.0))
+                    mapped = LABEL_MAP.get(label, label)
+                    probs[mapped] = score
+            except Exception:
+                st.error("Unexpected response from HF API. See raw output below.")
+                st.write(out)
+            else:
+                # Sort by score desc
+                sorted_probs = sorted(probs.items(), key=lambda x: x[1], reverse=True)
+                pred_label, pred_score = sorted_probs[0]
+                st.write("**Predicted emotion:**", pred_label)
+                st.write("**Probabilities:**")
+                for lab, sc in sorted_probs:
+                    st.write(f"{lab}: {sc:.4f}")
